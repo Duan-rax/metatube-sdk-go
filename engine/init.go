@@ -72,11 +72,14 @@ func (e *Engine) initMovieProviders() {
 
 		// Add movie provider by name.
 		e.movieProviders.Set(name, provider)
-		// Add movie provider by host.
-		host := provider.URL().Hostname()
-		e.movieHostProviders.Set(host,
-			append(e.movieHostProviders.
-				GetOrDefault(host, nil), provider))
+		hosts := []string{provider.URL().Hostname()}
+		if aliases, ok := provider.(mt.MovieURLHostAliases); ok {
+			hosts = append(hosts, aliases.MovieURLHostAliases()...)
+		}
+		for _, host := range hosts {
+			e.movieHostProviders.Set(host,
+				append(e.movieHostProviders.GetOrDefault(host, nil), provider))
+		}
 	}
 }
 

@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -14,6 +16,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/text/language"
 
+	"github.com/metatube-community/metatube-sdk-go/common/fetch"
+	"github.com/metatube-community/metatube-sdk-go/internal/envconfig"
 	"github.com/metatube-community/metatube-sdk-go/provider"
 	"github.com/metatube-community/metatube-sdk-go/provider/internal/scraper"
 	"github.com/metatube-community/metatube-sdk-go/provider/internal/testkit"
@@ -38,6 +42,7 @@ func card(id, title, cover string) string {
 
 func TestJavDB_FC2SearchMetadata(t *testing.T) {
 	jav := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		assert.Empty(t, r.Header.Get("Cookie"))
 		assert.Equal(t, "/search", r.URL.Path)
 		assert.Equal(t, "FC2-3119569", r.URL.Query().Get("q"))
 		assert.Equal(t, "all", r.URL.Query().Get("f"))
@@ -65,6 +70,58 @@ func TestJavDB_FC2SearchMetadata(t *testing.T) {
 	byURL, err := jav.GetMovieInfoByURL("https://javdb.com/search?q=FC2-PPV-3119569")
 	require.NoError(t, err)
 	assert.Equal(t, info, byURL)
+}
+
+func TestJavDB_ConfiguredCookie(t *testing.T) {
+	for _, mode := range []string{"cookie", "cookie_file"} {
+		t.Run(mode, func(t *testing.T) {
+			const session = "_session=sample; preference=1"
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/search":
+					if r.Header.Get("Cookie") != session {
+						w.WriteHeader(http.StatusUnauthorized)
+						return
+					}
+					_, _ = fmt.Fprint(w, "<div class='movie-list'>"+card("FC2-3119569", "Example", "/cover.jpg")+"</div>")
+				case "/cover.jpg":
+					assert.Empty(t, r.Header.Get("Cookie"))
+					_, _ = fmt.Fprint(w, "test image")
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			t.Cleanup(server.Close)
+			jav := &JavDB{
+				Fetcher: fetch.Default(&fetch.Config{Transport: server.Client().Transport}),
+				Scraper: scraper.NewDefaultScraper(Name, server.URL, Priority, language.Japanese,
+					scraper.WithTransport(server.Client().Transport)),
+			}
+			cfg := envconfig.NewConfig()
+			switch mode {
+			case "cookie":
+				cfg.Set(mode, session)
+			case "cookie_file":
+				file := filepath.Join(t.TempDir(), "javdb_cookie")
+				require.NoError(t, os.WriteFile(file, []byte(session+"\n"), 0600))
+				cfg.Set(mode, file)
+			}
+			require.NoError(t, jav.SetConfig(cfg))
+			info, err := jav.GetMovieInfoByID("3119569")
+			require.NoError(t, err)
+			res, err := jav.Fetch(info.CoverURL)
+			require.NoError(t, err)
+			require.NoError(t, res.Body.Close())
+		})
+	}
+}
+
+func TestJavDB_InvalidCookieIsRedacted(t *testing.T) {
+	cfg := envconfig.NewConfig()
+	cfg.Set("cookie", "session=example\r\nbad")
+	err := New().SetConfig(cfg)
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "example")
 }
 
 func TestJavDB_FetchImage(t *testing.T) {

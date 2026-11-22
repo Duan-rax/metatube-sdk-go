@@ -1,7 +1,10 @@
 package javdb
 
 import (
+	"errors"
+	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 
@@ -17,8 +20,10 @@ import (
 )
 
 var (
-	_ provider.MovieProvider = (*JavDB)(nil)
-	_ provider.Fetcher       = (*JavDB)(nil)
+	_ provider.MovieProvider       = (*JavDB)(nil)
+	_ provider.Fetcher             = (*JavDB)(nil)
+	_ provider.ConfigSetter        = (*JavDB)(nil)
+	_ provider.MovieURLHostAliases = (*JavDB)(nil)
 
 	scorePattern = regexp.MustCompile(`\d+(?:\.\d+)?`)
 	datePattern  = regexp.MustCompile(`\d{4}-\d{2}-\d{2}`)
@@ -30,8 +35,8 @@ const (
 	baseURL  = "https://javdb.com/"
 )
 
-// JavDB provides basic FC2 metadata from public search results. Detail pages
-// may require login, so lookups use the FC2 number rather than a detail-page ID.
+// JavDB reads basic FC2 metadata from search results, optionally using an
+// existing JavDB session.
 type JavDB struct {
 	*fetch.Fetcher
 	*scraper.Scraper
@@ -45,8 +50,44 @@ func New() *JavDB {
 	}
 }
 
+func (jav *JavDB) SetConfig(config provider.Config) error {
+	value, _ := config.GetString("cookie")
+	file, _ := config.GetString("cookie_file")
+	value, file = strings.TrimSpace(value), strings.TrimSpace(file)
+	if file != "" {
+		if value != "" {
+			return errors.New("set either cookie or cookie_file")
+		}
+		contents, err := os.ReadFile(file)
+		if err != nil {
+			return errors.New("cannot read JavDB cookie_file")
+		}
+		value = strings.TrimSpace(string(contents))
+		if value == "" {
+			return errors.New("JavDB cookie_file is empty")
+		}
+	}
+	if value == "" {
+		return nil
+	}
+	cookies, err := http.ParseCookie(value)
+	if err != nil {
+		return errors.New("invalid JavDB Cookie header value")
+	}
+	for _, cookie := range cookies {
+		// Set host-only HTTPS cookies for search, independent of the image fetcher.
+		cookie.Secure = true
+		cookie.Path = "/search"
+	}
+	return jav.ClonedCollector().SetCookies(jav.URL().String(), cookies)
+}
+
 func (jav *JavDB) NormalizeMovieID(id string) string {
 	return fc2util.ParseNumber(strings.TrimSpace(id))
+}
+
+func (*JavDB) MovieURLHostAliases() []string {
+	return []string{"www.javdb.com"}
 }
 
 func (jav *JavDB) ParseMovieIDFromURL(rawURL string) (string, error) {

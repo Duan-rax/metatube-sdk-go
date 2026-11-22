@@ -60,6 +60,11 @@ type MovieProvider interface {
 	GetMovieInfoByURL(url string) (*model.MovieInfo, error)
 }
 
+type MovieURLHostAliases interface {
+	// MovieURLHostAliases returns additional hostnames accepted by the provider.
+	MovieURLHostAliases() []string
+}
+
 type ActorSearcher interface {
 	// SearchActor searches matched actor/s.
 	SearchActor(keyword string) ([]*model.ActorSearchResult, error)

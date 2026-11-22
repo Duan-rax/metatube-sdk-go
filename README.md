@@ -14,6 +14,7 @@ Metadata Tube SDK in Golang.
     - [Contents](#contents)
     - [Features](#features)
     - [Installation](#installation)
+- [FC2 providers](#fc2-providers)
     - [Credits](#credits)
     - [License](#license)
 
@@ -51,6 +52,43 @@ the below Go command to install SDK.
 ```sh
 go get -u github.com/metatube-community/metatube-sdk-go
 ```
+
+## FC2 providers
+
+The `FC2PPVDB` provider reads public article pages on `fc2cmadb.com`.
+Existing numeric IDs and article links on `fc2ppvdb.com` resolve through the same provider.
+It reads the title, cover, release date, runtime, publisher and tags when present in the page.
+
+`JavDB` matches the exact FC2 number in the search results. Public search is the default.
+To use the results visible to your signed-in account, configure the value of the JavDB
+`Cookie` request header, such as `name=value; other=value`. Supply the header value alone.
+Use either `MT_MOVIE_PROVIDER_JAVDB__COOKIE` or `MT_MOVIE_PROVIDER_JAVDB__COOKIE_FILE`,
+then restart the MetaTube backend. Keep the cookie out of the repository and logs.
+MetaTube uses it only for HTTPS searches on `javdb.com`. Results can contain the title,
+cover, release date and score. This integration reads the search cards.
+
+For Docker Compose, put the value on one line in a private file and add the following
+settings to the existing `metatube` service:
+
+```yaml
+services:
+  metatube:
+    environment:
+      MT_MOVIE_PROVIDER_JAVDB__COOKIE_FILE: /run/secrets/javdb_cookie
+    secrets:
+      - javdb_cookie
+
+secrets:
+  javdb_cookie:
+    file: /path/to/private/javdb_cookie
+```
+
+`FC2DB` is also available through the standard provider registry. To inspect an
+individual source from the backend, request `/v1/movies/FC2PPVDB/<number>`,
+`/v1/movies/FC2DB/<number>` or `/v1/movies/JavDB/<number>`.
+For a deployment that needs a trusted proxy for the official FC2 scraper, set
+`MT_MOVIE_PROVIDER_FC2__PROXY` to the proxy URL and leave unrelated providers on
+their normal network path.
 
 ## Credits
 
