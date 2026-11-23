@@ -2,11 +2,13 @@ package javdb
 
 import (
 	"errors"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/gocolly/colly/v2"
 	"golang.org/x/text/language"
@@ -40,7 +42,10 @@ const (
 type JavDB struct {
 	*fetch.Fetcher
 	*scraper.Scraper
-	cookieFile string
+	cookie           string
+	cookieFile       string
+	cookieSavedAfter time.Time
+	gate             requestGate
 }
 
 func New() *JavDB {
@@ -52,74 +57,140 @@ func New() *JavDB {
 }
 
 func (jav *JavDB) SetConfig(config provider.Config) error {
+	if config.Has("interval") {
+		interval, err := config.GetDuration("interval")
+		if err != nil || interval <= 0 {
+			return errors.New("JavDB interval must be a positive duration")
+		}
+		jav.gate.interval = interval
+	}
+	if value, _ := config.GetString("pause_until"); value != "" {
+		until, err := time.Parse(time.RFC3339, value)
+		if err != nil {
+			return errors.New("JavDB pause_until must be an RFC3339 timestamp")
+		}
+		jav.gate.pauseUntil = until
+	}
 	value, _ := config.GetString("cookie")
 	file, _ := config.GetString("cookie_file")
 	value, file = strings.TrimSpace(value), strings.TrimSpace(file)
+	if stamp, _ := config.GetString("cookie_saved_after"); stamp != "" {
+		after, err := time.Parse(time.RFC3339, stamp)
+		if err != nil || file == "" {
+			return errors.New("JavDB cookie_saved_after requires an RFC3339 timestamp and cookie_file")
+		}
+		jav.cookieSavedAfter = after
+	}
 	if file != "" {
 		if value != "" {
 			return errors.New("set either cookie or cookie_file")
 		}
-		if _, err := readCookieFile(file); err != nil {
+		if _, _, err := readCookieFile(file); err != nil {
 			return err
 		}
 		jav.cookieFile = file
-		c := jav.ClonedCollector()
-		c.DisableCookies()
-		c.SetRedirectHandler(func(req *http.Request, via []*http.Request) error {
-			// The file supplies credentials only to the initial search request.
-			req.Header.Del("Cookie")
-			if len(via) >= 10 {
-				return errors.New("too many JavDB redirects")
+	}
+	if err := validateCookie(value); err != nil {
+		return err
+	}
+	jav.cookie = value
+	if jav.cookie == "" && jav.cookieFile == "" {
+		return nil
+	}
+	c := jav.ClonedCollector()
+	c.DisableCookies()
+	c.SetRedirectHandler(func(req *http.Request, via []*http.Request) error {
+		// The Cookie goes only on the initial HTTPS search, never a redirect.
+		req.Header.Del("Cookie")
+		start := via[0]
+		if start.Header.Get("Cookie") != "" {
+			switch strings.TrimSuffix(req.URL.Path, "/") {
+			case "/login", "/users/login", "/users/sign_in":
+				return errLoginRequired
 			}
-			return nil
-		})
+			if req.URL.Scheme != start.URL.Scheme || req.URL.Host != start.URL.Host {
+				return errLoginRequired
+			}
+		}
+		if len(via) >= 10 {
+			return errors.New("too many JavDB redirects")
+		}
 		return nil
-	}
-	if value == "" {
-		return nil
-	}
-	cookies, err := http.ParseCookie(value)
-	if err != nil {
-		return errors.New("invalid JavDB Cookie header value")
-	}
-	for _, cookie := range cookies {
-		// Set host-only HTTPS cookies for search, independent of the image fetcher.
-		cookie.Secure = true
-		cookie.Path = "/search"
-	}
-	return jav.ClonedCollector().SetCookies(jav.URL().String(), cookies)
+	})
+	return nil
 }
 
-func readCookieFile(file string) (string, error) {
-	contents, err := os.ReadFile(file)
+func readCookieFile(path string) (string, time.Time, error) {
+	file, err := os.Open(path)
 	if err != nil {
-		return "", errors.New("cannot read JavDB cookie_file")
+		return "", time.Time{}, errors.New("cannot read JavDB cookie_file")
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return "", time.Time{}, errors.New("cannot stat JavDB cookie_file")
+	}
+	contents, err := io.ReadAll(file)
+	if err != nil {
+		return "", time.Time{}, errors.New("cannot read JavDB cookie_file")
 	}
 	value := strings.TrimSpace(string(contents))
+	return value, info.ModTime(), validateCookie(value)
+}
+
+func validateCookie(value string) error {
 	if value != "" {
 		if _, err := http.ParseCookie(value); err != nil {
-			return "", errors.New("invalid JavDB Cookie header value")
+			return errors.New("invalid JavDB Cookie header value")
 		}
 	}
-	return value, nil
+	return nil
 }
 
 func (jav *JavDB) visitSearch(c *colly.Collector, homepage string) error {
-	if jav.cookieFile == "" {
-		return c.Visit(homepage)
+	cookie := jav.cookie
+	stale := false
+	if jav.cookieFile != "" {
+		value, saved, err := readCookieFile(jav.cookieFile)
+		if err != nil {
+			return err
+		}
+		cookie = value
+		stale = saved.Before(jav.cookieSavedAfter)
 	}
-	cookie, err := readCookieFile(jav.cookieFile)
-	if err != nil {
+	if cookie != "" && jav.URL().Scheme != "https" {
+		return errors.New("JavDB Cookie requires HTTPS")
+	}
+	if err := jav.gate.begin(cookie, stale); err != nil {
 		return err
 	}
+	var status int
+	var retryAfter string
+	var loginRequired bool
+	defer func() { jav.gate.finish(cookie, loginRequired, status, retryAfter) }()
+	c.OnError(func(r *colly.Response, _ error) {
+		if r != nil {
+			status = r.StatusCode
+			if r.Headers != nil {
+				retryAfter = r.Headers.Get("Retry-After")
+			}
+		}
+	})
 	if cookie == "" {
 		return c.Visit(homepage)
 	}
-	if jav.URL().Scheme != "https" {
-		return errors.New("JavDB Cookie requires HTTPS")
-	}
+	c.OnHTML("form[action^='/login'] input[type='password'], form[action^='/users/sign_in'] input[type='password']", func(_ *colly.HTMLElement) {
+		loginRequired = true
+	})
 	headers := http.Header{"Cookie": {cookie}, "Referer": {baseURL}}
-	return c.Request(http.MethodGet, homepage, nil, nil, headers)
+	err := c.Request(http.MethodGet, homepage, nil, nil, headers)
+	if errors.Is(err, errLoginRequired) {
+		loginRequired = true
+	}
+	if loginRequired {
+		return errLoginRequired
+	}
+	return err
 }
 
 func (jav *JavDB) NormalizeMovieID(id string) string {

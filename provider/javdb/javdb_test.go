@@ -8,7 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,6 +17,7 @@ import (
 	"golang.org/x/text/language"
 
 	"github.com/metatube-community/metatube-sdk-go/common/fetch"
+	mterrors "github.com/metatube-community/metatube-sdk-go/errors"
 	"github.com/metatube-community/metatube-sdk-go/internal/envconfig"
 	"github.com/metatube-community/metatube-sdk-go/provider"
 	"github.com/metatube-community/metatube-sdk-go/provider/internal/scraper"
@@ -29,6 +30,7 @@ func newTestProvider(t *testing.T, handler http.HandlerFunc) *JavDB {
 	t.Cleanup(server.Close)
 	jav := New()
 	jav.Scraper = scraper.NewDefaultScraper(Name, server.URL, Priority, language.Japanese)
+	jav.gate.interval = time.Nanosecond
 	return jav
 }
 
@@ -143,6 +145,7 @@ func TestJavDB_CookieFileReloadsWithoutForwardingCookies(t *testing.T) {
 	t.Cleanup(server.Close)
 	jav := &JavDB{Scraper: scraper.NewDefaultScraper(Name, server.URL, Priority, language.Japanese,
 		scraper.WithTransport(server.Client().Transport))}
+	jav.gate.interval = time.Nanosecond
 	file := filepath.Join(t.TempDir(), "javdb_cookie")
 	require.NoError(t, os.WriteFile(file, nil, 0600))
 	cfg := envconfig.NewConfig()
@@ -260,22 +263,92 @@ func TestJavDB_TitleAndLazyImageFallback(t *testing.T) {
 }
 
 func TestJavDB_ConcurrentLookups(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
 	jav := newTestProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-release
 		fmt.Fprint(w, `<div class="movie-list">`+card(r.URL.Query().Get("q"), "Example", "/cover.jpg")+`</div>`)
 	})
-	var wg sync.WaitGroup
-	for _, id := range []string{"3119569", "3108774"} {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			info, err := jav.GetMovieInfoByID(id)
-			assert.NoError(t, err)
-			if assert.NotNil(t, info) {
-				assert.Equal(t, id, info.ID)
-			}
-		}()
-	}
-	wg.Wait()
+	jav.gate.interval = time.Minute
+	done := make(chan error, 1)
+	go func() {
+		_, err := jav.GetMovieInfoByID("3119569")
+		done <- err
+	}()
+	<-started
+	_, concurrent := jav.GetMovieInfoByURL("https://javdb.com/search?q=FC2-3108774")
+	close(release)
+	require.NoError(t, <-done)
+	assertHTTPStatus(t, concurrent, http.StatusTooManyRequests)
+	_, err := jav.GetMovieInfoByID("3108774")
+	assertHTTPStatus(t, err, http.StatusTooManyRequests)
+}
+
+func assertHTTPStatus(t *testing.T, err error, status int) {
+	t.Helper()
+	var httpError *mterrors.HTTPError
+	require.ErrorAs(t, err, &httpError)
+	assert.Equal(t, status, httpError.Code)
+}
+
+func TestJavDB_RetryAfter(t *testing.T) {
+	var calls atomic.Int32
+	jav := newTestProvider(t, func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Retry-After", "7200")
+		w.WriteHeader(http.StatusTooManyRequests)
+	})
+	_, err := jav.GetMovieInfoByID("3119569")
+	require.Error(t, err)
+	assert.Greater(t, time.Until(jav.gate.next), time.Hour)
+	_, err = jav.GetMovieInfoByID("3108774")
+	assertHTTPStatus(t, err, http.StatusTooManyRequests)
+	assert.EqualValues(t, 1, calls.Load())
+}
+
+func TestJavDB_PauseAndRejectInvalidCookie(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/search", r.URL.Path)
+		if r.Header.Get("Cookie") == "session=invalid" {
+			http.Redirect(w, r, "/login", http.StatusFound)
+			return
+		}
+		_, _ = fmt.Fprint(w, `<div class="movie-list">`+card("FC2-3119569", "Example", "/cover.jpg")+`</div>`)
+	}))
+	t.Cleanup(server.Close)
+	jav := &JavDB{Scraper: scraper.NewDefaultScraper(Name, server.URL, Priority, language.Japanese,
+		scraper.WithTransport(server.Client().Transport))}
+	file := filepath.Join(t.TempDir(), "javdb_cookie")
+	require.NoError(t, os.WriteFile(file, []byte("session=invalid"), 0600))
+	now := time.Now()
+	old := now.Add(-2 * time.Hour)
+	require.NoError(t, os.Chtimes(file, old, old))
+	cfg := envconfig.NewConfig()
+	cfg.Set("cookie_file", file)
+	cfg.Set("interval", "1ns")
+	cfg.Set("pause_until", now.Add(time.Hour).Format(time.RFC3339))
+	cfg.Set("cookie_saved_after", now.Add(-time.Hour).Format(time.RFC3339))
+	require.NoError(t, jav.SetConfig(cfg))
+	_, err := jav.GetMovieInfoByID("3119569")
+	assertHTTPStatus(t, err, http.StatusServiceUnavailable)
+	jav.gate.pauseUntil = now.Add(-time.Hour)
+	_, err = jav.GetMovieInfoByID("3119569")
+	assertHTTPStatus(t, err, http.StatusUnauthorized)
+	assert.True(t, jav.gate.next.IsZero())
+
+	require.NoError(t, os.Chtimes(file, now, now))
+	_, err = jav.GetMovieInfoByID("3119569")
+	assertHTTPStatus(t, err, http.StatusUnauthorized)
+	next := jav.gate.next
+	assert.False(t, next.IsZero())
+	_, err = jav.GetMovieInfoByID("3119569")
+	assertHTTPStatus(t, err, http.StatusUnauthorized)
+	assert.Equal(t, next, jav.gate.next)
+
+	require.NoError(t, os.WriteFile(file, []byte("session=fresh"), 0600))
+	_, err = jav.GetMovieInfoByID("3119569")
+	require.NoError(t, err)
 }
 
 func TestJavDB_GetMovieInfoByID(t *testing.T) {

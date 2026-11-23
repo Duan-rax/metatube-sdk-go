@@ -69,6 +69,17 @@ Keep the cookie out of the repository and logs.
 MetaTube uses it only for HTTPS searches on `javdb.com`. Results can contain the title,
 cover, release date and score. This integration reads the search cards.
 
+Set `MT_MOVIE_PROVIDER_JAVDB__INTERVAL` to a Go duration such as `2m`; the default
+is `1m`. MetaTube permits one in-flight JavDB search. Requests inside the interval
+return a rate-limit response immediately, so other providers can continue and
+cached metadata is available. An upstream `429` or `403` pauses new searches for
+at least 30 minutes or the longer `Retry-After` value. When JavDB asks a signed-in
+session to log in again, MetaTube rejects that Cookie until its value changes.
+
+Use `MT_MOVIE_PROVIDER_JAVDB__PAUSE_UNTIL` with an RFC3339 timestamp during a known
+service pause. For a Cookie file, `MT_MOVIE_PROVIDER_JAVDB__COOKIE_SAVED_AFTER`
+sets the earliest acceptable file update time for a signed-in search.
+
 For Docker Compose, put the value on one line in `javdb-cookie` in a dedicated private
 directory and add the following settings to the existing `metatube` service:
 
