@@ -40,6 +40,7 @@ const (
 type JavDB struct {
 	*fetch.Fetcher
 	*scraper.Scraper
+	cookieFile string
 }
 
 func New() *JavDB {
@@ -58,14 +59,21 @@ func (jav *JavDB) SetConfig(config provider.Config) error {
 		if value != "" {
 			return errors.New("set either cookie or cookie_file")
 		}
-		contents, err := os.ReadFile(file)
-		if err != nil {
-			return errors.New("cannot read JavDB cookie_file")
+		if _, err := readCookieFile(file); err != nil {
+			return err
 		}
-		value = strings.TrimSpace(string(contents))
-		if value == "" {
-			return errors.New("JavDB cookie_file is empty")
-		}
+		jav.cookieFile = file
+		c := jav.ClonedCollector()
+		c.DisableCookies()
+		c.SetRedirectHandler(func(req *http.Request, via []*http.Request) error {
+			// The file supplies credentials only to the initial search request.
+			req.Header.Del("Cookie")
+			if len(via) >= 10 {
+				return errors.New("too many JavDB redirects")
+			}
+			return nil
+		})
+		return nil
 	}
 	if value == "" {
 		return nil
@@ -80,6 +88,38 @@ func (jav *JavDB) SetConfig(config provider.Config) error {
 		cookie.Path = "/search"
 	}
 	return jav.ClonedCollector().SetCookies(jav.URL().String(), cookies)
+}
+
+func readCookieFile(file string) (string, error) {
+	contents, err := os.ReadFile(file)
+	if err != nil {
+		return "", errors.New("cannot read JavDB cookie_file")
+	}
+	value := strings.TrimSpace(string(contents))
+	if value != "" {
+		if _, err := http.ParseCookie(value); err != nil {
+			return "", errors.New("invalid JavDB Cookie header value")
+		}
+	}
+	return value, nil
+}
+
+func (jav *JavDB) visitSearch(c *colly.Collector, homepage string) error {
+	if jav.cookieFile == "" {
+		return c.Visit(homepage)
+	}
+	cookie, err := readCookieFile(jav.cookieFile)
+	if err != nil {
+		return err
+	}
+	if cookie == "" {
+		return c.Visit(homepage)
+	}
+	if jav.URL().Scheme != "https" {
+		return errors.New("JavDB Cookie requires HTTPS")
+	}
+	headers := http.Header{"Cookie": {cookie}, "Referer": {baseURL}}
+	return c.Request(http.MethodGet, homepage, nil, nil, headers)
 }
 
 func (jav *JavDB) NormalizeMovieID(id string) string {
@@ -156,7 +196,7 @@ func (jav *JavDB) GetMovieInfoByID(id string) (*model.MovieInfo, error) {
 			PreviewImages: []string{},
 		}
 	})
-	if err := c.Visit(homepage); err != nil {
+	if err := jav.visitSearch(c, homepage); err != nil {
 		return nil, err
 	}
 	if info == nil {

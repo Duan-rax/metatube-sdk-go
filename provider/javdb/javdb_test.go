@@ -124,6 +124,47 @@ func TestJavDB_InvalidCookieIsRedacted(t *testing.T) {
 	assert.NotContains(t, err.Error(), "example")
 }
 
+func TestJavDB_CookieFileReloadsWithoutForwardingCookies(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/search":
+			if r.Header.Get("Cookie") == "session=redirect" {
+				http.Redirect(w, r, "/result", http.StatusFound)
+				return
+			}
+			_, _ = fmt.Fprint(w, "<div class='movie-list'>"+card("FC2-3119569", "Example "+r.Header.Get("Cookie"), "/cover.jpg")+"</div>")
+		case "/result":
+			assert.Empty(t, r.Header.Get("Cookie"))
+			_, _ = fmt.Fprint(w, "<div class='movie-list'>"+card("FC2-3119569", "Redirect", "/cover.jpg")+"</div>")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	jav := &JavDB{Scraper: scraper.NewDefaultScraper(Name, server.URL, Priority, language.Japanese,
+		scraper.WithTransport(server.Client().Transport))}
+	file := filepath.Join(t.TempDir(), "javdb_cookie")
+	require.NoError(t, os.WriteFile(file, nil, 0600))
+	cfg := envconfig.NewConfig()
+	cfg.Set("cookie_file", file)
+	require.NoError(t, jav.SetConfig(cfg))
+
+	for _, row := range []struct{ cookie, title string }{
+		{"", "Example"},
+		{"session=first", "Example session=first"},
+		{"session=redirect", "Redirect"},
+		{"session=second", "Example session=second"},
+		{"", "Example"},
+	} {
+		next := file + ".new"
+		require.NoError(t, os.WriteFile(next, []byte(row.cookie), 0600))
+		require.NoError(t, os.Rename(next, file))
+		info, err := jav.GetMovieInfoByID("3119569")
+		require.NoError(t, err)
+		assert.Equal(t, row.title, info.Title)
+	}
+}
+
 func TestJavDB_FetchImage(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, baseURL, r.Referer())

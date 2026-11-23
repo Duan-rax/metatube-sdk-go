@@ -63,7 +63,9 @@ It reads the title, cover, release date, runtime, publisher and tags when presen
 To use the results visible to your signed-in account, configure the value of the JavDB
 `Cookie` request header, such as `name=value; other=value`. Supply the header value alone.
 Use either `MT_MOVIE_PROVIDER_JAVDB__COOKIE` or `MT_MOVIE_PROVIDER_JAVDB__COOKIE_FILE`,
-then restart the MetaTube backend. Keep the cookie out of the repository and logs.
+then restart the MetaTube backend to activate the configuration. Cookie file updates
+take effect on the next uncached lookup. An empty file uses anonymous search.
+Keep the cookie out of the repository and logs.
 MetaTube uses it only for HTTPS searches on `javdb.com`. Results can contain the title,
 cover, release date and score. This integration reads the search cards.
 
@@ -82,6 +84,10 @@ secrets:
   javdb_cookie:
     file: /path/to/private/javdb_cookie
 ```
+
+For a co-located Emby plugin that replaces its Cookie file atomically, mount the
+dedicated secret directory read-only and point `MT_MOVIE_PROVIDER_JAVDB__COOKIE_FILE`
+at the file inside that directory. Mounting the directory lets MetaTube see replacements.
 
 `FC2DB` is also available through the standard provider registry. To inspect an
 individual source from the backend, request `/v1/movies/FC2PPVDB/<number>`,
