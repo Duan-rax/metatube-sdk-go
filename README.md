@@ -69,25 +69,21 @@ Keep the cookie out of the repository and logs.
 MetaTube uses it only for HTTPS searches on `javdb.com`. Results can contain the title,
 cover, release date and score. This integration reads the search cards.
 
-For Docker Compose, put the value on one line in a private file and add the following
-settings to the existing `metatube` service:
+For Docker Compose, put the value on one line in `javdb-cookie` in a dedicated private
+directory and add the following settings to the existing `metatube` service:
 
 ```yaml
 services:
   metatube:
     environment:
-      MT_MOVIE_PROVIDER_JAVDB__COOKIE_FILE: /run/secrets/javdb_cookie
-    secrets:
-      - javdb_cookie
-
-secrets:
-  javdb_cookie:
-    file: /path/to/private/javdb_cookie
+      MT_MOVIE_PROVIDER_JAVDB__COOKIE_FILE: /opt/metatube-secrets/javdb-cookie
+    volumes:
+      - /path/to/private-directory:/opt/metatube-secrets:ro
 ```
 
-For a co-located Emby plugin that replaces its Cookie file atomically, mount the
-dedicated secret directory read-only and point `MT_MOVIE_PROVIDER_JAVDB__COOKIE_FILE`
-at the file inside that directory. Mounting the directory lets MetaTube see replacements.
+Mounting the directory lets MetaTube see file replacements after a co-located Emby
+plugin saves the Cookie. The `/opt` target stays separate from the PostgreSQL socket
+volume mounted at `/var/run`.
 
 `FC2DB` is also available through the standard provider registry. To inspect an
 individual source from the backend, request `/v1/movies/FC2PPVDB/<number>`,
